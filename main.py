@@ -7,42 +7,152 @@ import machine
 from umqtt import MQTTClient
 import pm
 import atcmd 
-import request 
+import gc
+import usocket
+import ussl 
+from misc import Power 
 
 # ==========================================
 # CONFIGURACOES
 # ==========================================
-VERSAO_ATUAL = "1.4"
-INTERVALO_ENVIO = 120
+VERSAO_ATUAL = "2.3" # V22 - Autocura de Rede
+INTERVALO_ENVIO = 60 
 
-# MQTT (Apenas para dados)
+# MQTT
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_TOPIC_DADOS = "infratron/v1/dados"
 DEVICE_ID = "Infratron_001"
 
-# OTA (Atualizacao via HTTP)
-# Cole aqui os links RAW dos seus arquivos
-URL_VERSAO = "http://seusite.com/versao.txt"   # Arquivo contendo apenas "1.3"
-URL_FIRMWARE = "http://seusite.com/main.py"    # O codigo novo
+# OTA
+HOST_GITHUB = "raw.githubusercontent.com"
+PATH_VERSAO = "/vrasd2/MTECH/main/versao.txt"
+PATH_FIRMWARE = "/vrasd2/MTECH/main/main.py"
+OTA_CHECK_FREQ = 1 
 
-# Frequencia de Checagem OTA (Para economizar dados)
-# 1 = Checa todo ciclo
-# 10 = Checa a cada 10 ciclos (20 min)
-OTA_CHECK_FREQ = 5 
-
-# Arquivos Locais
-ARQUIVO_BUFFER = "buffer.txt"
-ARQUIVO_TEMP = "temp.txt"
+# Arquivos
+DIR_ROOT = "/usr/"
+ARQUIVO_BUFFER = DIR_ROOT + "buffer.txt"
+ARQUIVO_TEMP = DIR_ROOT + "temp.txt"
+ARQUIVO_NOVO = DIR_ROOT + "main_novo.py"
 
 # ==========================================
-# 1. SETUP
+# 1. SETUP & TOOLS
 # ==========================================
-def boot_safety_delay():
-    print("--- BOOT V13 (HTTP OTA) ---")
-    utime.sleep(3)
+def boot_check():
+    print("--- BOOT V22 (AUTOCURA) ---")
+    utime.sleep(2)
+
+def forcar_reset():
+    print("[SYS] INICIANDO RESET...")
+    utime.sleep(2)
+    try: Power.powerRestart()
+    except: pass
+    utime.sleep(2)
+    try: machine.reset()
+    except: pass
+    while True: pass
 
 # ==========================================
-# 2. BUFFER
+# 2. GESTAO DE REDE AVANCADA (AUTOCURA)
+# ==========================================
+def check_net():
+    try:
+        i = dataCall.getInfo(1,0)
+        if isinstance(i,tuple) and len(i)>2 and isinstance(i[2],list) and len(i[2])>2:
+            ip = i[2][2]
+            return ip != '0.0.0.0' and ip != ''
+    except: pass
+    return False
+
+def reparar_conexao_nuclear():
+    """
+    Protocolo de Autocura:
+    Derruba o sinal de radio (Modo Aviao) e sobe novamente.
+    Isso força a torre a limpar a sessao e entregar novo IP.
+    """
+    print("[REDE] !!! ATIVANDO PROTOCOLO DE AUTOCURA !!!")
+    try:
+        print("[REDE] Modo Aviao ON...")
+        net.setModemFun(0) 
+        utime.sleep(10) # Espera 10s para garantir desconexao total
+        
+        print("[REDE] Modo Aviao OFF (Buscando Torre)...")
+        net.setModemFun(1)
+        utime.sleep(10) # Tempo para registrar na torre
+        
+        print("[REDE] Ativando Dados...")
+        dataCall.activate(1)
+        utime.sleep(5)
+        
+        if check_net():
+            print("[REDE] RECUPERADO COM SUCESSO!")
+            return True
+        else:
+            print("[REDE] Ainda sem IP. Tentando novamente no proximo ciclo.")
+    except Exception as e:
+        print("[REDE] Erro Autocura: " + str(e))
+    return False
+
+# ==========================================
+# 3. HTTP RAW TOOL
+# ==========================================
+def http_get_raw_save(host, path, dest_file):
+    s = None
+    try:
+        print("[RAW] Connect: " + host)
+        addr = usocket.getaddrinfo(host, 443)[0][-1]
+        s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        s.connect(addr)
+        ssl_s = ussl.wrap_socket(s, server_hostname=host)
+        req = "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: QPY\r\n\r\n".format(path, host)
+        ssl_s.write(req.encode())
+        print("[RAW] Baixando...")
+        header_finished = False
+        buffer = b""
+        with open(dest_file, 'w') as f:
+            while True:
+                chunk = ssl_s.read(512) 
+                if not chunk: break
+                if not header_finished:
+                    buffer += chunk
+                    idx = buffer.find(b"\r\n\r\n")
+                    if idx >= 0:
+                        header_finished = True
+                        f.write(buffer[idx+4:])
+                        buffer = b""
+                else: f.write(chunk)
+        ssl_s.close(); s.close()
+        return True
+    except:
+        if s: 
+            try: s.close()
+            except: pass
+        return False
+
+def http_get_version(host, path):
+    s = None
+    try:
+        addr = usocket.getaddrinfo(host, 443)[0][-1]
+        s = usocket.socket(usocket.AF_INET, usocket.SOCK_STREAM)
+        s.connect(addr)
+        ssl_s = ussl.wrap_socket(s, server_hostname=host)
+        req = "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: QPY\r\n\r\n".format(path, host)
+        ssl_s.write(req.encode())
+        resp = b""
+        while True:
+            data = ssl_s.read(128)
+            if not data: break
+            resp += data
+        ssl_s.close(); s.close()
+        idx = resp.find(b"\r\n\r\n")
+        if idx > 0: return resp[idx+4:].decode().strip()
+        return ""
+    except:
+        if s: s.close()
+        return ""
+
+# ==========================================
+# 4. BUFFER
 # ==========================================
 class DataBuffer:
     def _existe(self, path):
@@ -51,14 +161,12 @@ class DataBuffer:
     
     def salvar(self, payload):
         try:
-            # Limita tamanho (30KB)
             try:
                 if os.stat(ARQUIVO_BUFFER)[6] > 30000: os.remove(ARQUIVO_BUFFER)
             except: pass
-            
             with open(ARQUIVO_BUFFER, 'a') as f:
                 f.write(payload + "\n")
-            print("[BUF] Salvo Offline.")
+            print("[BUF] Salvo.")
         except: pass
 
     def processar_fila(self, mqtt):
@@ -94,59 +202,36 @@ class DataBuffer:
     def tem_dados(self): return self._existe(ARQUIVO_BUFFER)
 
 # ==========================================
-# 3. OTA MANAGER (HTTP)
+# 5. OTA MANAGER
 # ==========================================
 class OTAManager:
     def checar_e_atualizar(self):
-        print("[OTA] Checando versao no servidor...")
-        try:
-            # 1. Baixa o arquivo de texto com a versao
-            r = request.get(URL_VERSAO)
-            if r.status_code == 200:
-                ver_remota = r.text.strip()
-                r.close()
-                print("[OTA] Remota: " + ver_remota + " | Local: " + VERSAO_ATUAL)
-                
-                # Compara strings. Se diferente, atualiza.
-                if ver_remota != VERSAO_ATUAL:
-                    print("[OTA] Nova versao encontrada! Baixando...")
-                    return self._download_firmware()
-                else:
-                    print("[OTA] Sistema atualizado.")
-            else:
-                print("[OTA] Erro HTTP Versao: " + str(r.status_code))
-                r.close()
-        except Exception as e:
-            print("[OTA] Erro Check: " + str(e))
-        return False
-
-    def _download_firmware(self):
-        tmp = "main_novo.py"
-        try:
-            r = request.get(URL_FIRMWARE)
-            if r.status_code == 200:
-                with open(tmp, 'w') as f: f.write(r.text)
-                r.close()
-                
-                # Validacao simples
-                if os.stat(tmp)[6] < 100:
-                    os.remove(tmp); return False
-                
-                print("[OTA] Download OK. Aplicando...")
-                try: os.remove("main.py")
+        print("[OTA] Checando...")
+        gc.collect()
+        v_remota = http_get_version(HOST_GITHUB, PATH_VERSAO)
+        print("[OTA] Web: [" + v_remota + "] Modulo: [" + VERSAO_ATUAL + "]")
+        if v_remota != "" and v_remota != VERSAO_ATUAL:
+            print("[OTA] ATUALIZANDO...")
+            gc.collect()
+            utime.sleep(1)
+            if http_get_raw_save(HOST_GITHUB, PATH_FIRMWARE, ARQUIVO_NOVO):
+                try:
+                    sz = os.stat(ARQUIVO_NOVO)[6]
+                    print("[OTA] Tamanho: " + str(sz))
+                    if sz > 100:
+                        print("[OTA] Aplicando...")
+                        try: os.remove("/usr/main.py")
+                        except: pass
+                        os.rename(ARQUIVO_NOVO, "/usr/main.py")
+                        print("[OTA] SUCESSO! RESETANDO...")
+                        forcar_reset()
                 except: pass
-                os.rename(tmp, "main.py")
-                utime.sleep(2)
-                machine.reset() # Reinicia
-                return True
-            r.close()
-        except:
-            try: os.remove(tmp)
+            print("[OTA] Falha Download.")
+            try: os.remove(ARQUIVO_NOVO)
             except: pass
-        return False
 
 # ==========================================
-# 4. DRIVERS
+# 6. DRIVERS
 # ==========================================
 class GPSDriver:
     def __init__(self):
@@ -230,38 +315,32 @@ def get_bat():
     except: pass
     return 0
 
-def check_net():
-    try:
-        i = dataCall.getInfo(1,0)
-        if isinstance(i,tuple) and len(i)>2 and isinstance(i[2],list) and len(i[2])>2:
-            return i[2][2] != '0.0.0.0'
-    except: pass
-    return False
-
 # ==========================================
-# 5. MAIN LOOP
+# 7. MAIN LOOP
 # ==========================================
 def main_loop():
-    boot_safety_delay()
-    
+    boot_check()
     pm.autosleep(1)
     gps = GPSDriver()
     sensor = DS18B20()
     buf = DataBuffer()
     ota = OTAManager()
     
+    # Inicializacao Padrao
     try: net.setModemFun(1); utime.sleep(5)
     except: pass
     
-    contador_ota = 0
+    ota_cnt = 0
+    falhas_rede = 0 # Contador de falhas (3 strikes)
 
     while True:
         try:
             t0 = utime.time()
-            print("\n>>> CICLO V13 <<<")
+            gc.collect()
+            print("\n>>> CICLO V22 <<<")
             
-            # --- 1. SENSORES ---
-            print("1. Lendo Sensores...")
+            # 1. SENSORES
+            print("1. Leitura...")
             temp = sensor.get() or 0.0
             bat = get_bat()
             
@@ -275,46 +354,55 @@ def main_loop():
             pl += '"bat":' + str(bat) + ','
             pl += '"lat":' + str(lat) + ','
             pl += '"lon":' + str(lon) + '}'
-            
-            print("   Dado: " + pl)
+            print("   " + pl)
 
-            # --- 2. REDE ---
+            # 2. REDE E AUTOCURA
             if not check_net():
+                print("   Sem IP. Tentando ativar...")
                 try: dataCall.activate(1); utime.sleep(2)
                 except: pass
             
-            if check_net():
-                # --- 3. OTA (HTTP POLLING) ---
-                contador_ota += 1
-                if contador_ota >= OTA_CHECK_FREQ:
-                    contador_ota = 0
+            rede_ok = check_net()
+            
+            if not rede_ok:
+                falhas_rede += 1
+                print("   [ALERTA] Falha de Rede #" + str(falhas_rede))
+                
+                # Se falhar 3 vezes consecutivas (3 min), ativa o nuclear
+                if falhas_rede >= 3:
+                    reparar_conexao_nuclear()
+                    falhas_rede = 0 # Reseta contador
+            else:
+                falhas_rede = 0 # Rede estavel, zera contador
+            
+            if rede_ok:
+                # 3. OTA
+                ota_cnt += 1
+                if ota_cnt >= OTA_CHECK_FREQ:
+                    ota_cnt = 0
                     ota.checar_e_atualizar()
                 
-                # --- 4. MQTT (PUBLISH E TCHAU) ---
+                # 4. MQTT
                 client = None
                 try:
-                    print("2. MQTT Envio...")
+                    print("2. MQTT...")
                     client = MQTTClient(DEVICE_ID, MQTT_BROKER, keepalive=60)
-                    # Nao setamos callback, nao damos subscribe
                     client.connect()
-                    
                     if buf.tem_dados(): buf.processar_fila(client)
                     client.publish(MQTT_TOPIC_DADOS, pl)
                     print("   >> SUCESSO!")
-                    
                 except Exception as e:
                     print("   Erro MQTT: " + str(e))
                     buf.salvar(pl)
-                
                 finally:
                     if client:
                         try: client.disconnect(); client.close()
                         except: pass
             else:
-                print("   Sem Rede. Buffer.")
+                print("   Offline. Bufferizando.")
                 buf.salvar(pl)
 
-            # --- 5. SLEEP ---
+            # 5. SLEEP
             tsleep = INTERVALO_ENVIO - (utime.time() - t0)
             if tsleep < 5: tsleep = 5
             print("Dormindo " + str(tsleep) + "s...")
@@ -325,5 +413,4 @@ def main_loop():
             utime.sleep(10)
 
 if __name__ == '__main__':
-
     main_loop()
