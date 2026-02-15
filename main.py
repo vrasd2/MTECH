@@ -12,7 +12,7 @@ import request
 # ==========================================
 # CONFIGURACOES
 # ==========================================
-VERSAO_ATUAL = "1.3"
+VERSAO_ATUAL = "1.4"
 INTERVALO_ENVIO = 120
 
 # MQTT (Apenas para dados)
@@ -325,4 +325,5 @@ def main_loop():
             utime.sleep(10)
 
 if __name__ == '__main__':
+
     main_loop()
