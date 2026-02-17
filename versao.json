@@ -5,6 +5,7 @@
   },
   "cliente_a": {
     "v": "2.6",
-    "url": "/vrasd2/MTECH/main/main_cliente_a.py"
+    "url": "/vrasd2/MTECH/main/fw_cliente_logistica_v3.0.py"
   }
+
 }
