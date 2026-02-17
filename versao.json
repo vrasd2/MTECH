@@ -1,7 +1,7 @@
 {
   "standard": {
     "v": "2.5",
-    "url": "/vrasd2/MTECH/main/main.py"
+    "url": "/vrasd2/MTECH/mainstandard_V2.5.6.py"
   },
   "cliente_a": {
     "v": "2.6",
@@ -9,3 +9,4 @@
   }
 
 }
+
